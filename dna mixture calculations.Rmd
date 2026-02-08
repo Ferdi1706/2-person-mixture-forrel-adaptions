@@ -1,0 +1,575 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(pedtools)
+library(forrel)
+library(ribd)
+
+# _________________________________________________________________________________________________
+# adaptions for kappa estimation in mixture case
+
+
+
+# adaption of forrel:::.PGD for 2-person mixture case
+my_PGD = function (wei, param, start, tol = sqrt(.Machine$double.eps), 
+                   beta = 0.5, sigma = 0.5, maxit = 500, x = NULL, ids = NULL, 
+                   verbose = FALSE, pair, keep){
+  
+  loglik = function(p, grad = FALSE) {
+    liks = as.numeric(p %*% wei)
+    if (!grad) 
+      return(sum(log(liks)))
+    list(loglik = sum(log(liks)), grad = as.numeric(wei %*% 
+                                                      (1/liks)))
+  }
+  k = 0
+  xk = start
+  LL = loglik(xk, grad = TRUE)
+  if (LL$loglik == -Inf) 
+    stop2("Initial value is impossible")
+  ak = 1
+  while (TRUE) {
+    ll = LL$loglik
+    gr = LL$grad
+    if (forrel:::stationary(xk, gr, tol = tol)) 
+      break
+    k = k + 1
+    ARMIJO = function(y) {
+      LHS = loglik(y)
+      RHS = ll + sigma * as.numeric(gr %*% (y - xk))
+      if (verbose) 
+        message("Armijo: y = ", rst(y, 5), "; LHS = ", 
+                rst(LHS, 5), "; Diff = ", LHS - RHS)
+      if (abs(LHS - RHS) < tol) 
+        return(NA)
+      LHS > RHS
+    }
+    y = forrel:::simplexProject(xk + ak * gr)
+    if (is.na(arm <- ARMIJO(y))) 
+      break
+    if (arm) {
+      if (verbose) 
+        message("Armijo OK - trying to increase step size")
+      while (TRUE) {
+        ak.try = ak/beta
+        if (verbose) 
+          message("Increasing ak to ", ak.try)
+        y.try = forrel:::simplexProject(xk + ak.try * gr)
+        if (all(abs(y.try - y) < tol) || !isTRUE(ARMIJO(y.try))) 
+          break
+        ak = ak.try
+        y = y.try
+      }
+    }
+    else {
+      if (verbose) 
+        message("Armijo FAIL - decreasing step size")
+      while (TRUE) {
+        if (ak < 1e-50) {
+          stop2("Precision problems encountered")
+        }
+        ak = ak * beta
+        if (verbose) 
+          message("Decreasing ak to ", ak)
+        y = forrel:::simplexProject(xk + ak * gr)
+        if (!isFALSE(ARMIJO(y))) 
+          break
+      }
+    }
+    newLL = loglik(y, grad = TRUE)
+    if (verbose) 
+      message(sprintf("*** Iteration %d: Point = %s; loglik = %s", 
+                      k, rst(y, 5), rst(newLL$loglik, 5)))
+    if (k >= maxit) 
+      break
+    xk = y
+    LL = newLL
+  }
+  if (verbose) 
+    message("Iterations: ", k)
+  list(estimate = xk, loglik = LL$loglik, iterations = k, ids = pair, 
+       nMarkers = sum(keep))
+}
+
+# calculate all possible genotypes of unknown person (person 2)
+get_person2_genotypes <- function(mix_alleles, person1_alleles) {
+  required_alleles <- setdiff(mix_alleles, person1_alleles)
+  
+  if (length(required_alleles) == 0) {
+    all_pairs <- expand.grid(rep(list(mix_alleles), 2), stringsAsFactors = FALSE)
+    all_pairs_sorted <- t(apply(all_pairs, 1, sort))
+    unique_pairs <- unique(all_pairs_sorted)
+    person2_genotypes <- apply(unique_pairs, 1, function(x) paste(x, collapse = ","))
+    return(person2_genotypes)
+  } else if (length(required_alleles) == 1) {
+    all_pairs <- expand.grid(rep(list(mix_alleles), 2), stringsAsFactors = FALSE)
+    all_pairs_sorted <- t(apply(all_pairs, 1, sort))
+    unique_pairs <- unique(all_pairs_sorted)
+    has_required <- apply(unique_pairs, 1, function(row) any(row == required_alleles))
+    filtered_pairs <- unique_pairs[has_required, , drop = FALSE]
+    person2_genotypes <- apply(filtered_pairs, 1, function(x) paste(x, collapse = ","))
+    return(person2_genotypes)
+  } else if (length(required_alleles) == 2) {
+    possible_pair <- sort(required_alleles)
+    person2_genotype <- paste(possible_pair, collapse = ",")
+    return(person2_genotype)
+  } else {
+    return(character(0))  # Leerer Vektor, falls keine Kombination möglich
+  }
+}
+
+compute_person2_genotypes <- function(mixture_list, person1_genotypes) {
+  markers <- names(mixture_list)
+  if (!all(markers %in% names(person1_genotypes))) {
+    stop("Markernamen stimmen nicht überein!")
+  }
+  
+  result <- list()
+  
+  for (marker in markers) {
+    mix_str <- mixture_list[[marker]]
+    mix_alleles <- unlist(strsplit(mix_str, ","))
+    person1_alleles <- person1_genotypes[[marker]]
+    
+    if (length(person1_alleles) != 2) {
+      stop("Person1 muss genau zwei Allele pro Marker haben (", marker, ")")
+    }
+    
+    person2_genotypes <- get_person2_genotypes(mix_alleles, person1_alleles)
+    result[[marker]] <- person2_genotypes  # Vektor für jeden Marker
+  }
+  
+  return(result)
+}
+
+# adaptions of forrel:::.getAlleleData2 for 2-person mixture case
+alleleDataMarker = function(x, markername, gt_marker, id_known, id_unknown, markers = NULL){
+  ids = c(id_known, id_unknown)
+  y = pedtools::nuclearPed(nch=2, sex = c(1,1),children = ids)
+  y = pedtools::transferMarkers(from = x, to = y)
+  genotype(y, marker=markername, id = id_unknown) = c(gt_marker[1],gt_marker[2])
+  marker_NA = markernamen[markernamen != markername]
+  for (marker in marker_NA){
+    genotype(y, marker = marker, id = id_known) = c(NA,NA)
+  }
+  # jetzt Stammbaumdaten für .likelihoodWeights vorbereiten
+  if (!is.null(markers)) 
+    y = selectMarkers(y, markers)
+  if (is.vector(ids)) {
+    ids = forrel:::.comb2(ids, vec = TRUE)
+  } else if (is.data.frame(ids)) {
+    ids = as.matrix(ids)
+  }
+  if (!is.matrix(ids) || nrow(ids) == 0 || ncol(ids) != 2) 
+    forrel:::stop2("`ids` must be either a vector of length at least 2, or a matrix-like with 2 columns")
+  mode(ids) = "character"
+  pairs = lapply(seq_len(nrow(ids)), function(i) ids[i, ])
+  allids = unique.default(unlist(pairs))
+  if (!all(allids %in% typedMembers(y))) 
+    forrel:::stop2("Untyped pedigree member: ", setdiff(allids, typedMembers(y)))
+  alleleData = forrel:::.getAlleleData2(y, ids = allids)
+  return(alleleData)
+}
+
+my_ibdEstimate = function (x, mixture, id_known, id_unknown, param = c("kappa", 
+                                                                       "delta"), markers = NULL, start = NULL, tol = sqrt(.Machine$double.eps), 
+                           beta = 0.5, sigma = 0.5, contourPlot = FALSE, levels = NULL, 
+                           verbose = TRUE) 
+{
+  ids = c(id_known, id_unknown)
+  if (!is.null(markers)) 
+    x = selectMarkers(x, markers)
+  if (is.vector(ids)) 
+    ids = forrel:::.comb2(ids, vec = TRUE)
+  else if (is.data.frame(ids)) 
+    ids = as.matrix(ids)
+  if (!is.matrix(ids) || nrow(ids) == 0 || ncol(ids) != 2) 
+    stop2("`ids` must be either a vector of length at least 2, or a matrix-like with 2 columns")
+  mode(ids) = "character"
+  pairs = lapply(seq_len(nrow(ids)), function(i) ids[i, ])
+  
+  st = Sys.time()
+  param = match.arg(param)
+  
+  marker_names = names(mixture)
+  person1_genotypes = list()
+  for (markername in marker_names){
+    person1_genotypes[markername] = paste(genotype(x, marker = markername,
+                                                   id = id_known), 
+                                          collapse = ",")
+    person1_genotypes <- lapply(person1_genotypes, 
+                                function(x) unlist(strsplit(x, ",")))
+  }
+  person2_results = compute_person2_genotypes(mixture, person1_genotypes)
+  
+  
+  
+  if (param == "kappa"){
+    wei = matrix(0, nrow=3,ncol=length(marker_names))
+  } else {
+    wei = matrix(0, nrow=9,ncol=length(marker_names))
+  }
+  
+  # wir brauchen eine for schleife, in der durch jedes element in person2_results
+  # gegangen wird und ein Stammbaum mit nur diesem Genotyp erzeugt wird
+  i = 0
+  for (markername in marker_names){
+    i = i+1
+    for (gt_marker in person2_results[markername][[1]]){
+      gt_marker = unlist(strsplit(gt_marker, ","))
+      dat = alleleDataMarker(x, markername, gt_marker, id_known, id_unknown)
+      pair = if (!is.null(names(dat))) names(dat) else c("_1", "_2")
+      keep = !is.na(dat[[1]]$f1) & !is.na(dat[[2]]$f2)
+      if (!all(keep)) 
+        dat = list(lapply(dat[[1]], `[`, keep), lapply(dat[[2]], 
+                                                       `[`, keep))
+      wei_marker_gt = forrel:::.likelihoodWeights(dat, param)
+      wei[,i] = wei[,i] + wei_marker_gt
+    }
+  }
+  
+  if (is.null(start)) 
+    start = switch(param, kappa = rep(1/3, 3), delta = rep(1/9, 
+                                                           9))
+  if (verbose) {
+    message(sprintf("Estimating '%s' coefficients", 
+                    param))
+    message(sprintf("Initial search value: (%s) ", 
+                    forrel:::rst(start, 3)))
+    message(sprintf("Pairs of individuals: %d ", length(pairs)))
+  }
+  resList = lapply(pairs, function(pair) {
+    if (verbose) 
+      message(sprintf("  %s: ", paste(pair, collapse = " vs. ")), 
+              appendLF = FALSE)
+    est = my_PGD(wei, param = param, start = start, 
+                 tol = tol, beta = beta, sigma = sigma, pair = pair, keep = keep)
+    if (verbose) 
+      message(sprintf("estimate = (%s), iterations = %d", 
+                      forrel:::rst(est$estimate, 3), est$iterations))
+    est
+  })
+  
+  coefs = do.call(rbind, lapply(resList, function(r) r$estimate))
+  ids = do.call(rbind, lapply(resList, function(r) r$ids))
+  N = unlist(lapply(resList, function(r) r$nMarkers))
+  res = structure(data.frame(ids, N, coefs), names = c("id1", 
+                                                       "id2", "N", if (param == "kappa") paste0("k", 
+                                                                                                0:2) else paste0("d", 1:9)), class = c("ibdEst", 
+                                                                                                                                       "data.frame"))
+  if (contourPlot) {
+    if (param == "delta") 
+      stop2("Contour plot is available only for 'kappa' estimation")
+    if (verbose) 
+      message("Preparing contour plot")
+    forrel:::contoursKappaML(x, allids, levels = levels)
+  }
+  if (verbose) 
+    message("Total time: ", forrel:::ftime(st))
+  res
+}
+
+
+# __________________________________________________________________________________________________
+# adaptions for forrel:::checkPairwise for 2-person mixture case
+
+
+getAlleleDataMarker = function(x, markername, gt_marker, id_known, id_unknown){
+  ids = c(id_known, id_unknown)
+  y = pedtools::nuclearPed(nch=2, sex = c(1,1),children = ids)
+  y = pedtools::transferMarkers(from = x, to = y)
+  genotype(y, marker=markername, id = id_unknown) = c(gt_marker[1],gt_marker[2])
+  marker_NA = markernamen[markernamen != markername]
+  for (marker in marker_NA){
+    genotype(y, marker = marker, id = id_known) = c(NA,NA)
+  }
+  dat = forrel:::.getAlleleData(y, c(id_known,id_unknown))
+  return(dat)
+}
+
+# adaption of forrel:::.IBDlikelihood
+# in essence: summation over all possible genotypes
+my_IBDlikelihood = function (x, mixture, id_known, id_unknown, kappa, 
+                             log = TRUE, total = TRUE) {
+  ids = c(id_known, id_unknown)
+  if (length(ids) != 2) 
+    stop2("`ids` must have length 2")
+  if (!is.numeric(kappa)) 
+    stop2("`kappa` must be numeric")
+  if (!length(kappa) %in% 2:3) 
+    stop2("`kappa` must have length 2 or 3")
+  kappa02 = if (length(kappa) == 3) 
+    kappa[c(1, 3)]
+  else kappa
+  
+  marker_names = names(mixture)
+  person1_genotypes = list()
+  for (markername in marker_names){
+    person1_genotypes[markername] = paste(genotype(x, marker = markername,
+                                                   id = id_known), 
+                                          collapse = ",")
+    person1_genotypes <- lapply(person1_genotypes, 
+                                function(x) unlist(strsplit(x, ",")))
+  }
+  person2_results = compute_person2_genotypes(mixture, person1_genotypes)
+  
+  # ab hier wieder ähniches vorgehen: über marker und mögliche genotypen iterieren,
+  # liks der möglichen genotypen summieren
+  
+  liks = rep(0, length(marker_names))
+  i = 0
+  for (markername in marker_names){
+    i = i+1
+    for (gt_marker in person2_results[markername][[1]]){
+      gt_marker = unlist(strsplit(gt_marker, ","))
+      dat = getAlleleDataMarker(x, markername, gt_marker, id_known, id_unknown)
+      liks_marker = forrel:::.IBDlikelihoodFAST(kappa02, dat$alleleMat, dat$freqMat)
+      liks[i] = liks[i] + liks_marker
+    }
+  }
+  print(liks)
+  
+  liks[liks < 0] = 0
+  
+  
+  
+  if (log) 
+    liks = log(liks)
+  if (total) 
+    if (log) 
+      sum(liks)
+  else prod(liks)
+  else liks
+}
+
+# adaption of forrel:::checkPairwise
+my_checkPairwise = function (x, mixture, id_known, id_unknown, excludeInbred = TRUE, plot = TRUE, labels = FALSE, 
+                             LRthreshold = 1000, ...) 
+{
+  includeIds = c(id_known, id_unknown)
+  if (excludeInbred) {
+    inbr = names(which(inbreeding(x) > 0))
+    if (length(inbr)) 
+      message("Excluding inbred individuals: ", inbr)
+    includeIds = setdiff(includeIds, inbr)
+  }
+  if (length(includeIds) < 2) {
+    message("No relationships to check")
+    return(invisible())
+  }
+  kEst = my_ibdEstimate(x, mixture, id_known, id_unknown, verbose = FALSE)
+  kTrue = kappaIBD(x, ids = includeIds, simplify = FALSE)
+  kMerge = merge(kEst, kTrue, by = 1:2)
+  k0 = kMerge$k0
+  k2 = kMerge$k2
+  kappa0 = kMerge$kappa0
+  kappa2 = kMerge$kappa2
+  kMerge$LR = vapply(1:nrow(kMerge), function(i) {
+    ids = kMerge[i, 1:2]
+    loglik1 = my_IBDlikelihood(x, mixture, id_known, id_unknown, kappa = c(k0[i], 
+                                                                           k2[i]), log = TRUE)
+    loglik2 = my_IBDlikelihood(x, mixture, id_known, id_unknown, kappa = c(kappa0[i], 
+                                                                           kappa2[i]), log = TRUE)
+    exp(loglik1 - loglik2)
+  }, FUN.VALUE = 1)
+  if (plot) {
+    kStr = paste(kappa0, kappa2, sep = "-")
+    kFac = factor(kStr, levels = unique(kStr[order(kappa0, 
+                                                   kappa2)]))
+    levels(kFac)[levels(kFac) == "0-0"] = "Parent-offspring"
+    levels(kFac)[levels(kFac) == "0.25-0.25"] = "Full siblings"
+    levels(kFac)[levels(kFac) == "0.5-0"] = "Half/Uncle/Grand"
+    levels(kFac)[levels(kFac) == "0.75-0"] = "First cousins"
+    levels(kFac)[levels(kFac) == "1-0"] = "Unrelated"
+    levels(kFac)[levels(kFac) == "NA-NA"] = "NA (inbred)"
+    cols = pchs = as.integer(kFac) + 1
+    nlev = nlevels(kFac)
+    legcol = legpch = seq_len(nlev) + 1
+    legcex = rep(1, nlev)
+    legtxt = levels(kFac)
+    err = kMerge$LR > LRthreshold
+    if (any(err, na.rm = T)) {
+      legcol = c(legcol, NA, 1)
+      legpch = c(legpch, NA, 1)
+      legcex = c(legcex, NA, 3)
+      legtxt = c(legtxt, NA, sprintf("LR > %d", LRthreshold))
+    }
+    ribd::ibdTriangle(...)
+    ribd::showInTriangle(kMerge[1:6], col = cols, pch = pchs, 
+                         labels = labels, new = FALSE)
+    points(k0[err], k2[err], pch = 1, lwd = 2, cex = 3)
+    legend("topright", title = " According to pedigree", 
+           title.adj = 0, bg = "whitesmoke", legend = legtxt, 
+           col = legcol, pch = legpch, pt.cex = legcex, lty = NA, 
+           lwd = 2)
+  }
+  kMerge
+}
+
+
+# _________________________________________________________________________________________
+# calculate probabilities for all possible genotypes of unknown person
+
+
+get_gtProbs = function(x, mixture, id_known, id_unknown, kappa){
+  param = "kappa"
+  marker_names = names(mixture)
+  person1_genotypes = list()
+  for (markername in marker_names){
+    person1_genotypes[markername] = paste(genotype(x, marker = markername,
+                                                   id = id_known), 
+                                          collapse = ",")
+    person1_genotypes = lapply(person1_genotypes, 
+                               function(x) unlist(strsplit(x, ",")))
+  }
+  person2_results = compute_person2_genotypes(mixture, person1_genotypes)
+  
+  liks = list()
+  
+  ids = c(id_known, id_unknown)
+  if (length(ids) != 2) 
+    stop2("`ids` must have length 2")
+  if (!is.numeric(kappa)) 
+    stop2("`kappa` must be numeric")
+  if (!length(kappa) %in% 2:3) 
+    stop2("`kappa` must have length 2 or 3")
+  kappa02 = if (length(kappa) == 3) 
+    kappa[c(1, 3)]
+  else kappa
+  
+  # ab hier wieder ähniches vorgehen: über marker und mögliche genotypen iterieren,
+  # liks der möglichen genotypen summieren
+  i = 0
+  for (markername in marker_names){
+    i = i+1
+    liks_marker_list = list()
+    sum_marker = 0
+    for (gt_marker in person2_results[markername][[1]]){
+      #print(gt_marker)
+      gt_marker_unlist = unlist(strsplit(gt_marker, ","))
+      dat = getAlleleDataMarker(x, markername, gt_marker_unlist, id_known, id_unknown)
+      liks_marker = forrel:::.IBDlikelihoodFAST(kappa02, dat$alleleMat, dat$freqMat)
+      #print(liks_marker)
+      liks_marker_list[[gt_marker]] = liks_marker
+      sum_marker = sum_marker + liks_marker
+    }
+    
+    liks_marker_list_normed = lapply(liks_marker_list, function(v) v / sum_marker)
+    liks[[markername]] = liks_marker_list_normed
+  }
+  
+  return(liks)
+}
+
+
+
+# ______________________________________________________________________________________________________
+# application to real case data
+
+
+# Konstruktion von Stammbaum Vollbruderschaft
+x = pedtools::nuclearPed(nch=2, father = "Fa", mother = "Mo", sex = c(1,1), children = c("Person1", "Person2"))
+
+plot(x)
+
+# Einlesen der Allelfrequenzen
+D3S1358 = read.table("D3S1358neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D1S1656 = read.table("D1S1656neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D6S1043 = read.table("D6S1043neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D13S317 = read.table("D13S317neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+PentaE = read.table("Penta_Eneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D16S539 = read.table("D16S539neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D18S51 = read.table("D18S51neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D2S1338 = read.table("D2S1338neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+CSF1PO = read.table("CSF1POneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+PentaD = read.table("Penta_Dneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+TH01 = read.table("TH01neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+vWA = read.table("vWAneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D21S11 = read.table("D21S11neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D7S820 = read.table("D7S820neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D5S818 = read.table("D5S818neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+TPOX = read.table("TPOXneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D8S1179 = read.table("D8S1179neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D12S391 = read.table("D12S391neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D19S433 = read.table("D19S433neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+FGA = read.table("FGAneu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D10S1248 = read.table("D10S1248neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D22S1045 = read.table("D22S1045neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D2S441 = read.table("D2S441neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+SE33 = read.table("SE33neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D7S1517 = read.table("D7S1517neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D3S1744 = read.table("D3S1744neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D2S1360 = read.table("D2S1360neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D6S474 = read.table("D6S474neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D4S2366 = read.table("D4S2366neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D8S1132 = read.table("D8S1132neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D5S2500 = read.table("D5S2500neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D21S2055 = read.table("D21S2055neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+D10S2325 = read.table("D10S2325neu.txt", header = TRUE, colClasses = c("character", "numeric"))
+
+
+# Setzen der Marker
+markerD10S1248 = pedtools::marker(x, name="D10S1248", Person1="14/14", alleles = D10S1248['Allel'][,1], afreq = D10S1248['Frequenz'][,1])
+markervWA = pedtools::marker(x, name="vWA", Person1="18/18", alleles = vWA['Allel'][,1], afreq = vWA['Frequenz'][,1])
+markerD16S539 = pedtools::marker(x, name="D16S539", Person1="11/12", alleles = D16S539['Allel'][,1], afreq = D16S539['Frequenz'][,1])
+markerD2S1338 = pedtools::marker(x, name="D2S1338", Person1="20/26", alleles = D2S1338['Allel'][,1], afreq = D2S1338['Frequenz'][,1])
+markerD8S1179 = pedtools::marker(x, name="D8S1179", Person1="13/16", alleles = D8S1179['Allel'][,1], afreq = D8S1179['Frequenz'][,1])
+markerD21S11 = pedtools::marker(x, name="D21S11", Person1="29/31", alleles = D21S11['Allel'][,1], afreq = D21S11['Frequenz'][,1])
+markerD18S51 = pedtools::marker(x, name="D18S51", Person1="15/16", alleles = D18S51['Allel'][,1], afreq = D18S51['Frequenz'][,1])
+markerD22S1045 = pedtools::marker(x, name="D22S1045", Person1="15/15", alleles = D22S1045['Allel'][,1], afreq = D22S1045['Frequenz'][,1])
+markerD19S433 = pedtools::marker(x, name="D19S433", Person1="13/14", alleles = D19S433['Allel'][,1], afreq = D19S433['Frequenz'][,1])
+markerTH01 = pedtools::marker(x, name="TH01", Person1="8/9.3", alleles = TH01['Allel'][,1], afreq = TH01['Frequenz'][,1])
+markerFGA = pedtools::marker(x, name="FGA", Person1="19/21", alleles = FGA['Allel'][,1], afreq = FGA['Frequenz'][,1])
+markerD2S441 = pedtools::marker(x, name="D2S441", Person1="11/14", alleles = D2S441['Allel'][,1], afreq = D2S441['Frequenz'][,1])
+markerD3S1358 = pedtools::marker(x, name="D3S1358", Person1="15/17", alleles = D3S1358['Allel'][,1], afreq = D3S1358['Frequenz'][,1])
+markerD1S1656 = pedtools::marker(x, name="D1S1656", Person1="12/13", alleles = D1S1656['Allel'][,1], afreq = D1S1656['Frequenz'][,1])
+markerD12S391 = pedtools::marker(x, name="D12S391", Person1="18/18.3", alleles = D12S391['Allel'][,1], afreq = D12S391['Frequenz'][,1])
+markerSE33 = pedtools::marker(x, name="SE33", Person1="14/28.2", alleles = SE33['Allel'][,1], afreq = SE33['Frequenz'][,1])
+
+
+x = pedtools::setMarkers(x, list(markerD10S1248,markervWA,markerD16S539,markerD2S1338,markerD8S1179,
+                                 markerD21S11,markerD18S51,markerD22S1045,markerD19S433,markerTH01,markerFGA,
+                                 markerD2S441,markerD3S1358,markerD1S1656,markerD12S391,markerSE33))
+
+
+markernamen = c("D10S1248","vWA","D16S539","D2S1338","D8S1179",
+                "D21S11","D18S51","D22S1045","D19S433","TH01","FGA",
+                "D2S441","D3S1358","D1S1656","D12S391","SE33")
+
+allele_mischung = list("14,15", "16,18", "9,11,12", "20,24,26", "12,13,16", 
+                       "29,30,31","14,15,16,18","11,15","13,14,15","8,9.3",
+                       "19,20,21,26","11,11.3,14","15,16,17","11,12,13,16",
+                       "18,18.3,21", "14,17,18,28.2")
+
+names(allele_mischung) = markernamen
+
+
+# calculate ibd estimates in mixture case
+kEst = my_ibdEstimate(x, allele_mischung, "Person1", "Person2")
+
+# calculate checkPairwise in mixture case
+my_checkPairwise(x, allele_mischung, "Person1", "Person2")
+
+
+# same result here
+loglik1 = my_IBDlikelihood(x, allele_mischung, "Person1", "Person2", 
+                           kappa = c(kEst$k0, kEst$k2), log = TRUE)
+
+# likelihood for other kappa coefficients, not the estimated ones
+loglik2 = my_IBDlikelihood(x, allele_mischung, "Person1", "Person2", 
+                           kappa = c(0.75, 0), log = TRUE)
+
+# -> possibility to compare different hypothesis
+exp(loglik1 - loglik2)
+
+# calculate probabilities for all possible genotypes of Person 2 given kappa coefficients (here (1,0,0))
+result = get_gtProbs(x,allele_mischung,"Person1", "Person2", c(1,0,0))
+result
+```
+
+
