@@ -513,7 +513,7 @@ D21S2055 = read.table("D21S2055neu.txt", header = TRUE, colClasses = c("characte
 D10S2325 = read.table("D10S2325neu.txt", header = TRUE, colClasses = c("character", "numeric"))
 
 
-# Setzen der Marker
+# set genotypes for person 1
 markerD10S1248 = pedtools::marker(x, name="D10S1248", Person1="14/14", alleles = D10S1248['Allel'][,1], afreq = D10S1248['Frequenz'][,1])
 markervWA = pedtools::marker(x, name="vWA", Person1="18/18", alleles = vWA['Allel'][,1], afreq = vWA['Frequenz'][,1])
 markerD16S539 = pedtools::marker(x, name="D16S539", Person1="11/12", alleles = D16S539['Allel'][,1], afreq = D16S539['Frequenz'][,1])
@@ -541,11 +541,11 @@ markernamen = c("D10S1248","vWA","D16S539","D2S1338","D8S1179",
                 "D21S11","D18S51","D22S1045","D19S433","TH01","FGA",
                 "D2S441","D3S1358","D1S1656","D12S391","SE33")
 
+# specify the dna mixture -> all alleles present in the mixture (person 1 known contributor, person 2 unknown contributor)
 allele_mischung = list("14,15", "16,18", "9,11,12", "20,24,26", "12,13,16", 
                        "29,30,31","14,15,16,18","11,15","13,14,15","8,9.3",
                        "19,20,21,26","11,11.3,14","15,16,17","11,12,13,16",
                        "18,18.3,21", "14,17,18,28.2")
-
 names(allele_mischung) = markernamen
 
 
@@ -571,5 +571,6 @@ exp(loglik1 - loglik2)
 result = get_gtProbs(x,allele_mischung,"Person1", "Person2", c(1,0,0))
 result
 ```
+
 
 
