@@ -16,6 +16,7 @@ library(ribd)
 
 
 # adaption of forrel:::.PGD for 2-person mixture case
+# Same as forrel:::.PGD, but `wei` is supplied externally (mixture case: weights summed over possible genotypes).
 my_PGD = function (wei, param, start, tol = sqrt(.Machine$double.eps), 
                    beta = 0.5, sigma = 0.5, maxit = 500, x = NULL, ids = NULL, 
                    verbose = FALSE, pair, keep){
@@ -571,6 +572,7 @@ exp(loglik1 - loglik2)
 result = get_gtProbs(x,allele_mischung,"Person1", "Person2", c(1,0,0))
 result
 ```
+
 
 
 
